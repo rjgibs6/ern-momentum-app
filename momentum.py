@@ -3,15 +3,19 @@
 ERN Momentum Signal
 -------------------
 Early Retirement Now strategy: compares monthly closes to their
-10-month Simple Moving Average to determine Risk-On / Risk-Off posture,
-and calculates a Dynamic Spending Ceiling for retirement planning.
+10-month Simple Moving Average to determine Risk-On / Risk-Off posture.
+
+Momentum score (ERN Part 63): 12 signals per asset
+  3 horizons (8, 9, 10 months) × 2 methods (SMA crossover + point-in-time)
+  × 2 index versions (total return + price return), averaged to a 0–1 score.
 """
 
-import argparse
 import sys
 from datetime import datetime
 
 import pandas as pd
+import requests
+from bs4 import BeautifulSoup
 from yahooquery import Ticker
 from rich import box
 from rich.console import Console
@@ -22,44 +26,121 @@ ASSETS = {
     "^SP500TR": "S&P 500 Total Return",
     "IEF":      "iShares 7-10yr Treasury",
 }
-SMA_MONTHS   = 10
-FETCH_MONTHS = 15
+# Price-return counterpart for each asset (second index version for momentum scoring)
+# IEF uses its own close vs adjclose as the two versions
+ASSET_ALT_TICKER = {
+    "^SP500TR": "^GSPC",
+    "IEF":      None,
+}
 
-RISK_ON_RATE  = 0.045   # 4.5% — Risk-On spending ceiling
-SAFETY_FLOOR  = 0.025   # 2.5% — Risk-Off safety floor
-CURRENT_AGE   = 62
-TARGET_AGE    = 95
-
-# Reference portfolio sizes for the spending ladder (when no --portfolio given)
-LADDER_SIZES  = [8_000_000, 10_000_000, 12_000_000, 15_000_000, 20_000_000, 25_000_000]
+SMA_MONTHS        = 10
+FETCH_MONTHS      = 15
+MOMENTUM_HORIZONS = [8, 9, 10]
 
 console = Console()
 
 
-def fetch_monthly_closes(ticker: str) -> pd.Series:
-    """Download monthly closes for ticker, returning only completed calendar months."""
-    df = Ticker(ticker).history(period="2y", interval="1mo")
+def fetch_cape() -> pd.Series:
+    """Scrape monthly Shiller CAPE ratios from multpl.com, indexed by month-end."""
+    r = requests.get(
+        "https://www.multpl.com/shiller-pe/table/by-month",
+        headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    soup  = BeautifulSoup(r.text, "html.parser")
+    table = soup.find("table", {"id": "datatable"})
+    rows  = table.find_all("tr")[1:]   # skip header
 
-    if isinstance(df, str) or df.empty:
-        console.print(f"\n  [red]Could not fetch data for {ticker}: {df}[/red]")
+    data = {}
+    for row in rows:
+        cols = row.find_all("td")
+        if len(cols) < 2:
+            continue
+        date_str = cols[0].get_text(strip=True)
+        val_str  = cols[1].get_text(strip=True)
+        try:
+            date = pd.to_datetime(date_str) + pd.offsets.MonthEnd(0)
+            data[date] = float(val_str)
+        except (ValueError, AttributeError):
+            continue
+
+    return pd.Series(data, name="CAPE").sort_index()
+
+
+def _clean_df(raw_df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Normalize index to month-end, drop NaNs and current in-progress month."""
+    df = raw_df.loc[ticker].copy()
+    df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
+    df.index = df.index + pd.offsets.MonthEnd(0)
+    df = df.dropna(how="all")
+    today = datetime.today()
+    mask = ~((df.index.month == today.month) & (df.index.year == today.year))
+    return df[mask].tail(FETCH_MONTHS)
+
+
+def fetch_both_closes(ticker: str) -> tuple[pd.Series, pd.Series]:
+    """
+    Download monthly closes for ticker.
+    Returns (adj_close, raw_close) — both normalized to month-end.
+    adj_close uses adjclose when available; raw_close is always the unadjusted close.
+    """
+    raw_df = Ticker(ticker).history(period="2y", interval="1mo")
+
+    if isinstance(raw_df, str) or raw_df.empty:
+        console.print(f"\n  [red]Could not fetch data for {ticker}: {raw_df}[/red]")
         sys.exit(1)
 
-    col = "adjclose" if "adjclose" in df.columns else "close"
-    closes = df.loc[ticker, col]
-    closes.index = pd.to_datetime(closes.index, utc=True).tz_convert(None)
-    closes.index = closes.index + pd.offsets.MonthEnd(0)
-    closes = closes.dropna()
+    df  = _clean_df(raw_df, ticker)
+    adj = df["adjclose"] if "adjclose" in df.columns else df["close"]
+    raw = df["close"]
 
-    today = datetime.today()
-    closes = closes[
-        ~((closes.index.month == today.month) & (closes.index.year == today.year))
-    ]
-
-    return closes.tail(FETCH_MONTHS)
+    return adj.rename(ticker), raw.rename(ticker)
 
 
-def make_table(ticker: str, label: str, closes: pd.Series, sma: pd.Series) -> Table:
-    """Build a Rich table for one asset."""
+def fetch_monthly_closes(ticker: str) -> pd.Series:
+    """Convenience wrapper — returns adj close only."""
+    adj, _ = fetch_both_closes(ticker)
+    return adj
+
+
+def compute_momentum_score(series_list: list[pd.Series]) -> tuple[int, int]:
+    """
+    ERN Part 63 momentum score across all provided price series.
+
+    For each series and each horizon n in MOMENTUM_HORIZONS:
+      Method 1 (SMA crossover)  : latest price > n-month rolling SMA
+      Method 2 (point-in-time)  : latest price > price exactly n months ago
+
+    Returns (n_bullish, total_signals).
+    Total signals = len(series_list) × len(MOMENTUM_HORIZONS) × 2 methods.
+    """
+    bullish = 0
+    total   = 0
+
+    for series in series_list:
+        latest = float(series.iloc[-1])
+
+        for n in MOMENTUM_HORIZONS:
+            # Method 1: SMA crossover
+            if len(series) >= n:
+                sma_val = series.rolling(window=n).mean().iloc[-1]
+                if pd.notna(sma_val):
+                    bullish += int(latest > float(sma_val))
+                    total   += 1
+
+            # Method 2: point-in-time (price n months ago = iloc[-(n+1)])
+            if len(series) > n:
+                past = float(series.iloc[-(n + 1)])
+                bullish += int(latest > past)
+                total   += 1
+
+    return bullish, total
+
+
+def make_table(ticker: str, label: str, closes: pd.Series, sma: pd.Series,
+               cape: pd.Series | None = None) -> Table:
+    """Build a Rich table for one asset, optionally with a CAPE column."""
     latest_date = closes.index[-1]
 
     table = Table(
@@ -73,6 +154,8 @@ def make_table(ticker: str, label: str, closes: pd.Series, sma: pd.Series) -> Ta
     table.add_column("Close",        justify="right", min_width=12)
     table.add_column("10-Mo SMA",    justify="right", min_width=12)
     table.add_column("% from Trend", justify="right", min_width=13)
+    if cape is not None:
+        table.add_column("CAPE", justify="right", min_width=8)
 
     for date in closes.index:
         price  = float(closes[date])
@@ -88,172 +171,100 @@ def make_table(ticker: str, label: str, closes: pd.Series, sma: pd.Series) -> Ta
             sma_text = Text("—", style="dim")
             pct_text = Text("—", style="dim")
 
-        table.add_row(
+        row = [
             Text(date.strftime("%b %d, %Y"), style=weight),
             Text(f"${price:,.2f}",           style=weight),
             sma_text,
             pct_text,
-        )
+        ]
+
+        if cape is not None:
+            cape_val = cape.get(date)
+            row.append(
+                Text(f"{cape_val:.2f}", style=weight) if cape_val is not None
+                else Text("—", style="dim")
+            )
+
+        table.add_row(*row)
 
     return table
 
 
-def show_spending_ceiling(risk_on: bool, latest_date: pd.Timestamp,
-                          portfolio: float | None) -> None:
-    """Print the Dynamic Spending Ceiling section."""
-    years         = TARGET_AGE - CURRENT_AGE
-    current_rate  = RISK_ON_RATE if risk_on else SAFETY_FLOOR
-    floor_rate    = SAFETY_FLOOR
-    ceiling_rate  = RISK_ON_RATE
-    regime_label  = "Risk-On" if risk_on else "Risk-Off"
-    regime_style  = "bold green" if risk_on else "bold red"
-
-    console.rule("[bold yellow]Dynamic Spending Ceiling[/bold yellow]")
-    console.print()
-    console.print(
-        f"  Retirement horizon : Age [bold]{CURRENT_AGE}[/bold] → [bold]{TARGET_AGE}[/bold]"
-        f"  ([bold]{years} years[/bold])"
-    )
-    console.print(f"  Success target     : 99% probability of portfolio lasting")
-    console.print(f"  Signal (as of {latest_date.strftime('%b %Y')})  : ", end="")
-    console.print(Text(f" {regime_label} ", style=f"bold white on {'green' if risk_on else 'red'}"))
-    console.print(
-        f"  Active rate        : [bold yellow]{current_rate*100:.1f}%[/bold yellow]"
-        f"  ({'ceiling' if risk_on else 'safety floor'})"
-    )
-    console.print()
-
-    if portfolio is not None:
-        # ── Personalised spending ──────────────────────────────────────────
-        annual   = portfolio * current_rate
-        monthly  = annual / 12
-        fl_ann   = portfolio * floor_rate
-        fl_mo    = fl_ann / 12
-        ceil_ann = portfolio * ceiling_rate
-        ceil_mo  = ceil_ann / 12
-        extra    = ceil_ann - fl_ann
-
-        console.print(f"  Portfolio value    : [bold]${portfolio:,.0f}[/bold]")
-        console.print()
-
-        spend_table = Table(box=box.SIMPLE, show_header=True, header_style="bold",
-                            title=f"Spending  ·  ${portfolio:,.0f} portfolio")
-        spend_table.add_column("Regime",           justify="left",  min_width=20)
-        spend_table.add_column("Rate",             justify="right", min_width=8)
-        spend_table.add_column("Annual",           justify="right", min_width=14)
-        spend_table.add_column("Monthly",          justify="right", min_width=14)
-
-        for label, rate, ann, mo, is_active in [
-            ("Safety Floor",      floor_rate,   fl_ann,   fl_mo,   not risk_on),
-            ("Spending Ceiling",  ceiling_rate, ceil_ann, ceil_mo, risk_on),
-        ]:
-            style = "bold green" if is_active else ""
-            marker = " ◀ active" if is_active else ""
-            spend_table.add_row(
-                Text(f"{label}{marker}", style=style),
-                Text(f"{rate*100:.1f}%", style=style),
-                Text(f"${ann:,.0f}",     style=style),
-                Text(f"${mo:,.0f}",      style=style),
-            )
-
-        console.print(spend_table)
-
-        if risk_on:
-            console.print(
-                f"  Extra spending vs. Safety Floor : "
-                f"[bold green]+${extra:,.0f}/yr  (+${extra/12:,.0f}/mo)[/bold green]"
-            )
-        console.print()
-
-    else:
-        # ── Reference ladder ──────────────────────────────────────────────
-        ladder = Table(
-            title=f"Spending Reference  ·  Age {CURRENT_AGE}→{TARGET_AGE}  ·  99% success",
-            box=box.ROUNDED,
-            header_style="bold",
-            show_lines=False,
-        )
-        ladder.add_column("Portfolio",            justify="right", min_width=13)
-        ladder.add_column("Floor 2.5%  Annual",   justify="right", min_width=16)
-        ladder.add_column("Floor 2.5%  Monthly",  justify="right", min_width=16)
-        ladder.add_column("Ceil 4.5%  Annual",    justify="right", min_width=15)
-        ladder.add_column("Ceil 4.5%  Monthly",   justify="right", min_width=15)
-
-        for pv in LADDER_SIZES:
-            fl_ann  = pv * floor_rate
-            fl_mo   = fl_ann / 12
-            c_ann   = pv * ceiling_rate
-            c_mo    = c_ann / 12
-            style   = "bold" if pv == 8_000_000 else ""
-            ladder.add_row(
-                Text(f"${pv:,.0f}",  style=style),
-                Text(f"${fl_ann:,.0f}", style=style),
-                Text(f"${fl_mo:,.0f}", style=style),
-                Text(f"${c_ann:,.0f}", style=style),
-                Text(f"${c_mo:,.0f}", style=style),
-            )
-
-        console.print(ladder)
-        console.print(
-            "  [dim]Run with --portfolio VALUE to see personalised spending amounts.[/dim]"
-        )
-        console.print()
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ERN Momentum Signal & Spending Ceiling")
-    parser.add_argument(
-        "--portfolio", "-p", type=float, metavar="VALUE",
-        help="Your portfolio value (e.g. 1000000) for personalised spending output",
-    )
-    args = parser.parse_args()
-
     console.print()
     console.rule("[bold cyan]ERN Momentum Signal[/bold cyan]")
     console.print()
 
-    results = {}
+    results    = {}   # ticker -> (label, adj, raw, sma)
+    alt_series = {}   # ticker -> alt adj close (second index version)
+
     for ticker, label in ASSETS.items():
         console.print(f"  [dim]Fetching {label} ({ticker})…[/dim]")
-        closes = fetch_monthly_closes(ticker)
-        if len(closes) < SMA_MONTHS:
+        adj, raw = fetch_both_closes(ticker)
+        if len(adj) < SMA_MONTHS:
             console.print(f"  [red]Insufficient data for {ticker}.[/red]")
             sys.exit(1)
-        sma = closes.rolling(window=SMA_MONTHS).mean()
-        results[ticker] = (label, closes, sma)
+        sma = adj.rolling(window=SMA_MONTHS).mean()
+        results[ticker] = (label, adj, raw, sma)
+
+        alt_ticker = ASSET_ALT_TICKER.get(ticker)
+        if alt_ticker:
+            console.print(f"  [dim]Fetching alt index {alt_ticker}…[/dim]")
+            alt_adj, _ = fetch_both_closes(alt_ticker)
+            alt_series[ticker] = alt_adj
+
+    console.print(f"  [dim]Fetching Shiller CAPE (multpl.com)…[/dim]")
+    cape = fetch_cape()
 
     # ── Signal summary ────────────────────────────────────────────────────
     console.print()
-    for ticker, (label, closes, sma) in results.items():
-        latest_price = float(closes.iloc[-1])
+    for ticker, (label, adj, raw, sma) in results.items():
+        latest_price = float(adj.iloc[-1])
         latest_sma   = float(sma.iloc[-1])
         pct          = (latest_price - latest_sma) / latest_sma * 100
-        latest_date  = closes.index[-1]
+        latest_date  = adj.index[-1]
         risk_on      = latest_price > latest_sma
+
+        # Two index versions per asset:
+        #   Equities: ^SP500TR (total return) + ^GSPC (price return)
+        #   Bonds:    IEF adjclose (total return) + IEF close (price-only)
+        if ticker in alt_series:
+            series_list = [adj, alt_series[ticker]]
+        else:
+            series_list = [adj, raw]
+
+        bullish, total = compute_momentum_score(series_list)
+        score          = bullish / total if total else 0.0
+        score_color    = "green" if score > 0.5 else ("yellow" if score == 0.5 else "red")
 
         signal    = Text("  RISK-ON  " if risk_on else "  RISK-OFF  ",
                          style="bold white on green" if risk_on else "bold white on red")
         pct_color = "green" if pct >= 0 else "red"
 
         console.print(f"  {label}")
-        console.print(f"    Signal  : ", end="")
+        console.print(f"    Signal    : ", end="")
         console.print(signal)
-        console.print(f"    As of   : [bold]{latest_date.strftime('%B %Y')}[/bold]")
-        console.print(f"    Close   : [bold]${latest_price:,.2f}[/bold]")
         console.print(
-            f"    10-Mo SMA: [bold]${latest_sma:,.2f}[/bold]  "
+            f"    Momentum  : [{score_color}]{bullish}/{total}  ({score:.0%})[/{score_color}]"
+            f"  [dim](12 signals: 3 horizons × 2 methods × 2 indices)[/dim]"
+        )
+        console.print(f"    As of     : [bold]{latest_date.strftime('%B %Y')}[/bold]")
+        console.print(f"    Close     : [bold]${latest_price:,.2f}[/bold]")
+        console.print(
+            f"    10-Mo SMA : [bold]${latest_sma:,.2f}[/bold]  "
             f"([{pct_color}]{pct:+.2f}%[/{pct_color}] from trend)"
         )
         console.print()
 
     # ── Individual tables ─────────────────────────────────────────────────
-    for ticker, (label, closes, sma) in results.items():
-        console.print(make_table(ticker, label, closes, sma))
+    for ticker, (label, adj, raw, sma) in results.items():
+        cape_col = cape if ticker == "^SP500TR" else None
+        console.print(make_table(ticker, label, adj, sma, cape=cape_col))
         console.print()
 
     # ── Combined index table ──────────────────────────────────────────────
     tickers    = list(results.keys())
-    all_closes = {t: results[t][1] for t in tickers}
+    all_closes = {t: results[t][1] for t in tickers}   # adj close
     all_labels = {t: results[t][0] for t in tickers}
 
     common_idx = all_closes[tickers[0]].index
@@ -280,12 +291,6 @@ def main() -> None:
 
     console.print(idx_table)
     console.print()
-
-    # ── Dynamic Spending Ceiling ──────────────────────────────────────────
-    sp500_closes = results["^SP500TR"][1]
-    sp500_sma    = results["^SP500TR"][2]
-    risk_on      = float(sp500_closes.iloc[-1]) > float(sp500_sma.iloc[-1])
-    show_spending_ceiling(risk_on, sp500_closes.index[-1], args.portfolio)
 
 
 if __name__ == "__main__":
