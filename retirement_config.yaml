@@ -1,0 +1,24 @@
+# retirement_config.yaml
+# Edit these values to match your situation.
+# All rates are annual decimals (e.g. 0.05 = 5%).
+
+# ── Portfolio ─────────────────────────────────────────────────────────────────
+initial_portfolio_value: 10000000  # Value at retirement start ($)
+equity_target: 0.85                 # Fixed equity allocation — informational only
+bond_target: 0.15                   # Fixed bond/cash allocation — informational only
+
+# ── Guyton-Klinger withdrawal rules ──────────────────────────────────────────
+base_withdrawal_rate: 0.035        # Initial annual withdrawal rate (5%)
+inflation_rate: 0.03                # Expected annual inflation used for COLA baseline (3%)
+prosperity_threshold: 1.20          # Portfolio > 120% of inflation-adj baseline → raise withdrawal
+prosperity_increase: 0.10           # Raise withdrawal by this fraction when prosperous (10%)
+capital_preservation_threshold: 0.80  # Portfolio < 80% of baseline → cut withdrawal
+capital_preservation_decrease: 0.10   # Cut withdrawal by this fraction when capital at risk (10%)
+max_withdrawal_rate: 0.06           # Hard annual withdrawal ceiling (6%)
+min_withdrawal_rate: 0.025          # Hard annual withdrawal floor (2.5%)
+
+# ── Momentum signal ───────────────────────────────────────────────────────────
+signal_strength_threshold: 0.30     # Below this strength → proportional withdrawal instead of directed
+
+# ── Audit log ─────────────────────────────────────────────────────────────────
+audit_log_path: retirement_audit.jsonl
