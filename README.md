@@ -23,24 +23,6 @@ python3 momentum.py --dividend 1.5   # subtract 1.5% dividend yield from CAPE SW
 python3 -m pip install -r requirements.txt
 ```
 
-## Quarterly cron job
-
-Runs at 8am on the 1st of January, April, July, and October.
-Output is saved to a dated file in your home directory with colors preserved.
-
-Add to crontab (`crontab -e`):
-
-```
-0 8 1 1,4,7,10 * cd /home/rob/ern-momentum-app && FORCE_COLOR=1 python3 momentum.py --dividend 1.5 > /home/rob/ern_report_$(date +\%Y-\%m-\%d).txt 2>&1
-```
-
-Read the output:
-
-```bash
-cat ~/ern_report_2026-04-01.txt        # with colors
-less -R ~/ern_report_2026-04-01.txt    # paged, with colors
-```
-
 ## Assets tracked
 
 | Ticker | Description |
