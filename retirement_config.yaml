@@ -8,14 +8,14 @@ equity_target: 0.85                 # Fixed equity allocation — informational 
 bond_target: 0.15                   # Fixed bond/cash allocation — informational only
 
 # ── Guyton-Klinger withdrawal rules ──────────────────────────────────────────
-base_withdrawal_rate: 0.035        # Initial annual withdrawal rate (5%)
+base_withdrawal_rate: 0.02        # Initial annual withdrawal rate (3.5%) but adjusted for dividends ~.015
 inflation_rate: 0.03                # Expected annual inflation used for COLA baseline (3%)
 prosperity_threshold: 1.20          # Portfolio > 120% of inflation-adj baseline → raise withdrawal
 prosperity_increase: 0.10           # Raise withdrawal by this fraction when prosperous (10%)
 capital_preservation_threshold: 0.80  # Portfolio < 80% of baseline → cut withdrawal
 capital_preservation_decrease: 0.10   # Cut withdrawal by this fraction when capital at risk (10%)
-max_withdrawal_rate: 0.06           # Hard annual withdrawal ceiling (6%)
-min_withdrawal_rate: 0.025          # Hard annual withdrawal floor (2.5%)
+max_withdrawal_rate: 0.045           # Hard annual withdrawal ceiling (6%) but adj 1.5% dividends
+min_withdrawal_rate: 0.01          # Hard annual withdrawal floor (2.5%) adj for dividends 1%
 
 # ── Momentum signal ───────────────────────────────────────────────────────────
 signal_strength_threshold: 0.30     # Below this strength → proportional withdrawal instead of directed

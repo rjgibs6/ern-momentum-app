@@ -10,6 +10,7 @@ Momentum score (ERN Part 63): 12 signals per asset
   × 2 index versions (total return + price return), averaged to a 0–1 score.
 """
 
+import argparse
 import sys
 from datetime import datetime
 
@@ -36,6 +37,15 @@ ASSET_ALT_TICKER = {
 SMA_MONTHS        = 10
 FETCH_MONTHS      = 15
 MOMENTUM_HORIZONS = [8, 9, 10]
+
+# ERN Part 54 — CAPE-based SWR models
+# SWR = intercept + slope / adjusted_CAPE
+# Adjusted CAPE = Shiller CAPE × CAPE_ADJUSTMENT (ERN's earnings-adjusted factor)
+CAPE_ADJUSTMENT = 0.775   # ERN adjustment: accounts for ~29% higher reported earnings
+CAPE_SWR_MODELS = [
+    ("Recommended",  0.0175,  0.50),   # intercept, slope
+    ("Conservative", -0.0025, 0.90),
+]
 
 console = Console()
 
@@ -68,22 +78,29 @@ def fetch_cape() -> pd.Series:
     return pd.Series(data, name="CAPE").sort_index()
 
 
-def _clean_df(raw_df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """Normalize index to month-end, drop NaNs and current in-progress month."""
+def _clean_df(raw_df: pd.DataFrame, ticker: str,
+              include_current: bool = False) -> pd.DataFrame:
+    """Normalize index to month-end, drop NaNs, and optionally drop current in-progress month."""
     df = raw_df.loc[ticker].copy()
     df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
     df.index = df.index + pd.offsets.MonthEnd(0)
+    df.index = df.index.normalize()              # strip intraday time → midnight
     df = df.dropna(how="all")
-    today = datetime.today()
-    mask = ~((df.index.month == today.month) & (df.index.year == today.year))
-    return df[mask].tail(FETCH_MONTHS)
+    df = df[~df.index.duplicated(keep="last")]   # keep latest bar per month-end
+    if not include_current:
+        today = datetime.today()
+        mask = ~((df.index.month == today.month) & (df.index.year == today.year))
+        df = df[mask]
+    return df.tail(FETCH_MONTHS)
 
 
-def fetch_both_closes(ticker: str) -> tuple[pd.Series, pd.Series]:
+def fetch_both_closes(ticker: str,
+                      include_current: bool = False) -> tuple[pd.Series, pd.Series]:
     """
     Download monthly closes for ticker.
     Returns (adj_close, raw_close) — both normalized to month-end.
     adj_close uses adjclose when available; raw_close is always the unadjusted close.
+    Pass include_current=True to retain the current in-progress month.
     """
     raw_df = Ticker(ticker).history(period="2y", interval="1mo")
 
@@ -91,7 +108,7 @@ def fetch_both_closes(ticker: str) -> tuple[pd.Series, pd.Series]:
         console.print(f"\n  [red]Could not fetch data for {ticker}: {raw_df}[/red]")
         sys.exit(1)
 
-    df  = _clean_df(raw_df, ticker)
+    df  = _clean_df(raw_df, ticker, include_current=include_current)
     adj = df["adjclose"] if "adjclose" in df.columns else df["close"]
     raw = df["close"]
 
@@ -181,7 +198,7 @@ def make_table(ticker: str, label: str, closes: pd.Series, sma: pd.Series,
         if cape is not None:
             cape_val = cape.get(date)
             row.append(
-                Text(f"{cape_val:.2f}", style=weight) if cape_val is not None
+                Text(f"{cape_val * 0.775:.2f}", style=weight) if cape_val is not None
                 else Text("—", style="dim")
             )
 
@@ -190,28 +207,132 @@ def make_table(ticker: str, label: str, closes: pd.Series, sma: pd.Series,
     return table
 
 
+def compute_momentum_history(
+    series_lists: dict[str, list[pd.Series]],
+) -> pd.DataFrame:
+    """
+    For each completed month in the data, compute the 12-signal momentum score
+    as of that month by slicing each series up to that date.
+
+    Returns a DataFrame indexed by date with columns
+    ``{ticker}_bullish`` and ``{ticker}_total``.
+    """
+    first_ticker = next(iter(series_lists))
+    dates = series_lists[first_ticker][0].index
+
+    rows = []
+    for date in dates:
+        row: dict = {"date": date}
+        for ticker, slist in series_lists.items():
+            sliced  = [s[s.index <= date] for s in slist]
+            bullish, total = compute_momentum_score(sliced)
+            row[f"{ticker}_bullish"] = bullish
+            row[f"{ticker}_total"]   = total
+        rows.append(row)
+
+    return pd.DataFrame(rows).set_index("date")
+
+
+def make_score_history_table(
+    history_df: pd.DataFrame,
+    labels: dict[str, str],
+) -> Table:
+    """Build a Rich table showing the momentum score for each past month."""
+    tickers     = list(labels.keys())
+    latest_date = history_df.index[-1]
+
+    table = Table(
+        title="Momentum Score History  ·  12 Signals per Asset",
+        box=box.ROUNDED,
+        header_style="bold",
+        show_lines=False,
+    )
+    table.add_column("Month End", justify="left",   min_width=21)
+    for ticker in tickers:
+        table.add_column(labels[ticker],  justify="right",  min_width=14)
+        table.add_column("Signal",        justify="center", min_width=9)
+
+    today = datetime.today()
+
+    for date, row in history_df.iterrows():
+        # Skip months with no computable signals (insufficient historical data)
+        if all(int(row[f"{ticker}_total"]) == 0 for ticker in tickers):
+            continue
+
+        is_live  = (date.month == today.month and date.year == today.year)
+        weight   = "bold" if date == latest_date else ""
+        date_str = date.strftime("%b %d, %Y") + (" (live)" if is_live else "")
+        cells    = [Text(date_str, style=weight)]
+
+        for ticker in tickers:
+            bullish = int(row[f"{ticker}_bullish"])
+            total   = int(row[f"{ticker}_total"])
+            score   = bullish / total if total else 0.0
+            color   = "green" if score > 0.5 else ("yellow" if score == 0.5 else "red")
+
+            cells.append(Text(
+                f"{bullish}/{total}  ({score:.0%})",
+                style=f"{weight} {color}".strip(),
+            ))
+
+            if score > 0.5:
+                sig = Text("Risk-On",  style=f"{weight} green".strip())
+            elif score < 0.5:
+                sig = Text("Risk-Off", style=f"{weight} red".strip())
+            else:
+                sig = Text("Neutral",  style=f"{weight} yellow".strip())
+            cells.append(sig)
+
+        table.add_row(*cells)
+
+    return table
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="ERN Momentum Signal")
+    parser.add_argument(
+        "--dividend", type=float, default=0.0, metavar="PCT",
+        help="Annual dividend yield %% to subtract from CAPE SWR (e.g. 1.5)",
+    )
+    args = parser.parse_args()
+    dividend = args.dividend / 100.0
+
     console.print()
     console.rule("[bold cyan]ERN Momentum Signal[/bold cyan]")
     console.print()
 
-    results    = {}   # ticker -> (label, adj, raw, sma)
-    alt_series = {}   # ticker -> alt adj close (second index version)
+    results          = {}   # ticker -> (label, adj, raw, sma)       completed months
+    results_live     = {}   # ticker -> (adj_live, raw_live)          including current month
+    alt_series       = {}   # ticker -> alt adj close                 completed months
+    alt_series_live  = {}   # ticker -> alt adj close                 including current month
+
+    today = datetime.today()
 
     for ticker, label in ASSETS.items():
         console.print(f"  [dim]Fetching {label} ({ticker})…[/dim]")
-        adj, raw = fetch_both_closes(ticker)
+        adj_live, raw_live = fetch_both_closes(ticker, include_current=True)
+
+        # Completed months: drop current in-progress month for SMA tables
+        not_current = ~((adj_live.index.month == today.month) &
+                        (adj_live.index.year  == today.year))
+        adj = adj_live[not_current]
+        raw = raw_live[not_current]
+
         if len(adj) < SMA_MONTHS:
             console.print(f"  [red]Insufficient data for {ticker}.[/red]")
             sys.exit(1)
         sma = adj.rolling(window=SMA_MONTHS).mean()
-        results[ticker] = (label, adj, raw, sma)
+        results[ticker]      = (label, adj, raw, sma)
+        results_live[ticker] = (adj_live, raw_live)
 
         alt_ticker = ASSET_ALT_TICKER.get(ticker)
         if alt_ticker:
             console.print(f"  [dim]Fetching alt index {alt_ticker}…[/dim]")
-            alt_adj, _ = fetch_both_closes(alt_ticker)
-            alt_series[ticker] = alt_adj
+            alt_adj_live, _ = fetch_both_closes(alt_ticker, include_current=True)
+            not_current_alt  = ~((alt_adj_live.index.month == today.month) &
+                                  (alt_adj_live.index.year  == today.year))
+            alt_series[ticker]      = alt_adj_live[not_current_alt]
+            alt_series_live[ticker] = alt_adj_live
 
     console.print(f"  [dim]Fetching Shiller CAPE (multpl.com)…[/dim]")
     cape = fetch_cape()
@@ -254,7 +375,53 @@ def main() -> None:
             f"    10-Mo SMA : [bold]${latest_sma:,.2f}[/bold]  "
             f"([{pct_color}]{pct:+.2f}%[/{pct_color}] from trend)"
         )
+
+        if ticker == "^SP500TR":
+            raw_cape = cape.iloc[-1] if cape is not None and len(cape) else None
+            if raw_cape is not None:
+                adj_cape = raw_cape * CAPE_ADJUSTMENT
+                div_str  = f" − {dividend*100:.2f}% div" if dividend else ""
+                for model_name, intercept, slope in CAPE_SWR_MODELS:
+                    gross = intercept + slope / adj_cape
+                    net   = gross - dividend
+                    if dividend:
+                        console.print(
+                            f"    CAPE SWR  : [bold]{gross:.2%}[/bold] gross"
+                            f" → [bold]{net:.2%}[/bold] net{div_str}  "
+                            f"[dim]({model_name}: {intercept*100:+.2f}% + "
+                            f"{slope} / adj.CAPE {adj_cape:.1f})[/dim]"
+                        )
+                    else:
+                        console.print(
+                            f"    CAPE SWR  : [bold]{gross:.2%}[/bold]  "
+                            f"[dim]({model_name}: {intercept*100:+.2f}% + "
+                            f"{slope} / adj.CAPE {adj_cape:.1f})[/dim]"
+                        )
+
+            if risk_on:
+                withdraw_text = Text("  Withdraw from: STOCKS  ", style="bold white on green")
+            else:
+                withdraw_text = Text("  Withdraw from: BONDS  ", style="bold white on red")
+            console.print(f"    Action    : ", end="")
+            console.print(withdraw_text)
+
         console.print()
+
+    # ── Momentum score history table ──────────────────────────────────────
+    series_lists_hist = {}
+    for ticker in results:
+        adj_live, raw_live = results_live[ticker]
+        if ticker in alt_series_live:
+            series_lists_hist[ticker] = [adj_live, alt_series_live[ticker]]
+        else:
+            series_lists_hist[ticker] = [adj_live, raw_live]
+
+    history_df = compute_momentum_history(series_lists_hist)
+    console.print(make_score_history_table(
+        history_df,
+        labels={t: results[t][0] for t in results},
+    ))
+    console.print()
 
     # ── Individual tables ─────────────────────────────────────────────────
     for ticker, (label, adj, raw, sma) in results.items():
@@ -262,35 +429,6 @@ def main() -> None:
         console.print(make_table(ticker, label, adj, sma, cape=cape_col))
         console.print()
 
-    # ── Combined index table ──────────────────────────────────────────────
-    tickers    = list(results.keys())
-    all_closes = {t: results[t][1] for t in tickers}   # adj close
-    all_labels = {t: results[t][0] for t in tickers}
-
-    common_idx = all_closes[tickers[0]].index
-    for t in tickers[1:]:
-        common_idx = common_idx.intersection(all_closes[t].index)
-
-    base = common_idx[0]
-    idx_table = Table(
-        title=f"Performance Index  ·  Base 100 = {base.strftime('%b %d, %Y')}",
-        box=box.ROUNDED, header_style="bold", show_lines=False,
-    )
-    idx_table.add_column("Month End", justify="left", min_width=12)
-    for t in tickers:
-        idx_table.add_column(all_labels[t], justify="right", min_width=14)
-
-    latest_date = common_idx[-1]
-    for date in common_idx:
-        weight = "bold" if date == latest_date else ""
-        row = [Text(date.strftime("%b %d, %Y"), style=weight)]
-        for t in tickers:
-            val = float(all_closes[t][date]) / float(all_closes[t][base]) * 100
-            row.append(Text(f"{val:.2f}", style=weight))
-        idx_table.add_row(*row)
-
-    console.print(idx_table)
-    console.print()
 
 
 if __name__ == "__main__":
