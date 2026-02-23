@@ -373,9 +373,11 @@ def main(dividend: float = 0.0) -> None:
             if raw_cape is not None:
                 adj_cape = raw_cape * CAPE_ADJUSTMENT
                 div_str  = f" − {dividend*100:.2f}% div" if dividend else ""
+                nets = []
                 for model_name, intercept, slope in CAPE_SWR_MODELS:
                     gross = intercept + slope / adj_cape
                     net   = gross - dividend
+                    nets.append(net)
                     if dividend:
                         console.print(
                             f"    CAPE SWR  : [bold]{gross:.2%}[/bold] gross"
@@ -389,6 +391,9 @@ def main(dividend: float = 0.0) -> None:
                             f"[dim]({model_name}: {intercept*100:+.2f}% + "
                             f"{slope} / adj.CAPE {adj_cape:.1f})[/dim]"
                         )
+                avg = sum(nets) / len(nets)
+                avg_label = "net avg" if dividend else "avg"
+                console.print(f"    CAPE SWR  : [bold]{avg:.2%}[/bold] {avg_label}  [dim](average of models)[/dim]")
 
             if risk_on:
                 withdraw_text = Text("  Withdraw from: STOCKS  ", style="bold white on green")
