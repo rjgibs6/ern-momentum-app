@@ -288,15 +288,7 @@ def make_score_history_table(
     return table
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="ERN Momentum Signal")
-    parser.add_argument(
-        "--dividend", type=float, default=0.0, metavar="PCT",
-        help="Annual dividend yield %% to subtract from CAPE SWR (e.g. 1.5)",
-    )
-    args = parser.parse_args()
-    dividend = args.dividend / 100.0
-
+def main(dividend: float = 0.0) -> None:
     console.print()
     console.rule("[bold cyan]ERN Momentum Signal[/bold cyan]")
     console.print()
@@ -432,4 +424,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="ERN Momentum Signal")
+    parser.add_argument(
+        "--dividend", type=float, default=0.0, metavar="PCT",
+        help="Annual dividend yield %% to subtract from CAPE SWR (e.g. 1.5)",
+    )
+    args = parser.parse_args()
+    main(dividend=args.dividend / 100.0)

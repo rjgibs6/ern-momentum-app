@@ -1,0 +1,5 @@
+.env
+__pycache__/
+*.pyc
+retirement_audit.jsonl
+.claude/
